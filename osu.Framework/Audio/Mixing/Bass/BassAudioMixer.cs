@@ -9,6 +9,7 @@ using ManagedBass;
 using ManagedBass.Mix;
 using osu.Framework.Extensions.EnumExtensions;
 using osu.Framework.Statistics;
+using osu.Framework.Logging;
 
 namespace osu.Framework.Audio.Mixing.Bass
 {
@@ -43,7 +44,7 @@ namespace osu.Framework.Audio.Mixing.Bass
             : base(fallbackMixer, identifier)
         {
             this.manager = manager;
-            EnqueueAction(createMixer);
+            // 不自动创建 mixer，需在设备初始化后由外部统一调用 createMixer
         }
 
         public override void AddEffect(IEffectParameter effect, int priority = 0) => EnqueueAction(() =>
@@ -83,6 +84,8 @@ namespace osu.Framework.Audio.Mixing.Bass
             if (Handle == 0 || bassChannel.Handle == 0)
                 return;
 
+            osu.Framework.Logging.Logger.Log($"[AudioDebug] AddInternal: Mixer={Identifier}, ChannelHandle={bassChannel.Handle}");
+
             if (!bassChannel.MixerChannelPaused)
                 ChannelPlay(bassChannel);
         }
@@ -113,12 +116,22 @@ namespace osu.Framework.Audio.Mixing.Bass
         /// </returns>
         public bool ChannelPlay(IBassAudioChannel channel, bool restart = false)
         {
+            if (Handle == 0)
+            {
+                // 尝试立即创建 mixer（在音频线程）
+                createMixer();
+            }
+
             if (Handle == 0 || channel.Handle == 0)
+            {
+                Logger.Log($"[AudioDebug] ChannelPlay failed: Mixer={Identifier}, Handle={Handle}, ChannelHandle={channel?.Handle}", LoggingTarget.Runtime, LogLevel.Error);
                 return false;
+            }
 
+            Logger.Log($"[AudioDebug] ChannelPlay: Mixer={Identifier}, ChannelHandle={channel.Handle}, Thread={Environment.CurrentManagedThreadId}", LoggingTarget.Runtime, LogLevel.Debug);
             AddChannelToBassMix(channel);
-            BassMix.ChannelRemoveFlag(channel.Handle, BassFlags.MixerChanPause);
-
+            bool removePause = BassMix.ChannelRemoveFlag(channel.Handle, BassFlags.MixerChanPause);
+            Logger.Log($"[AudioDebug] ChannelPlay: ChannelRemoveFlag={removePause}, LastError={ManagedBass.Bass.LastError}", LoggingTarget.Runtime, LogLevel.Debug);
             return true;
         }
 
@@ -196,7 +209,12 @@ namespace osu.Framework.Audio.Mixing.Bass
             if (ChannelIsActive(channel) == PlaybackState.Stopped)
                 ChannelPause(channel, true);
 
-            return BassMix.ChannelSetPosition(channel.Handle, position, mode | PositionFlags.MixerReset);
+            bool result = BassMix.ChannelSetPosition(channel.Handle, position, mode);
+
+            // Perform a flush so that ChannelGetPosition() immediately returns the new value.
+            flush();
+
+            return result;
         }
 
         /// <summary>
@@ -262,13 +280,55 @@ namespace osu.Framework.Audio.Mixing.Bass
         public void UpdateDevice(int deviceIndex)
         {
             if (Handle == 0)
+            {
                 createMixer();
+            }
             else
             {
                 ManagedBass.Bass.ChannelSetDevice(Handle, deviceIndex);
+                osu.Framework.Logging.Logger.Log($"[AudioDebug] UpdateDevice: Mixer={Identifier}, Handle={Handle}, DeviceIndex={deviceIndex}");
 
+                // 在WASAPI/ASIO模式下，子混音器已经在createMixer中添加到全局混音器了
+                // 检查是否已经连接到全局混音器，避免重复连接
                 if (manager?.GlobalMixerHandle.Value != null)
-                    BassMix.MixerAddChannel(manager.GlobalMixerHandle.Value.Value, Handle, BassFlags.MixerChanBuffer | BassFlags.MixerChanNoRampin);
+                {
+                    // 检查是否已经是全局混音器的通道
+                    var channelInfo = new ChannelInfo();
+                    if (ManagedBass.Bass.ChannelGetInfo(Handle, out channelInfo))
+                    {
+                        // 如果是解码模式，说明已经被添加到全局混音器中了
+                        if ((channelInfo.Flags & BassFlags.Decode) != 0)
+                        {
+                            osu.Framework.Logging.Logger.Log($"[AudioDebug] UpdateDevice: Mixer {Identifier} already in decode mode, skipping MixerAddChannel");
+                        }
+                        else
+                        {
+                            // 检查是否已经在全局混音器的通道列表中
+                            var mixerChannels = BassMix.ChannelGetMixer(Handle);
+                            if (mixerChannels == manager.GlobalMixerHandle.Value.Value)
+                            {
+                                osu.Framework.Logging.Logger.Log($"[AudioDebug] UpdateDevice: Mixer {Identifier} already connected to global mixer, skipping");
+                            }
+                            else
+                            {
+                                bool result = BassMix.MixerAddChannel(manager.GlobalMixerHandle.Value.Value, Handle, BassFlags.MixerChanBuffer | BassFlags.MixerChanNoRampin);
+                                int lastError = (int)ManagedBass.Bass.LastError;
+                                osu.Framework.Logging.Logger.Log($"[AudioDebug] MixerAddChannel (UpdateDevice) result={result}, LastError={lastError}");
+
+                                if (!result && lastError == 1) // BASS_ERROR_HANDLE - already added
+                                {
+                                    osu.Framework.Logging.Logger.Log($"[AudioDebug] UpdateDevice: Mixer {Identifier} already connected (BASS_ERROR_HANDLE), continuing");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 重新绑定所有 activeChannels
+            foreach (var channel in activeChannels.ToArray())
+            {
+                RemoveInternal(channel);
+                AddChannelToBassMix(channel);
             }
         }
 
@@ -279,11 +339,10 @@ namespace osu.Framework.Audio.Mixing.Bass
                 var channel = activeChannels[i];
                 if (channel.IsActive)
                     continue;
-
+                osu.Framework.Logging.Logger.Log($"[AudioDebug] Remove inactive channel: Mixer={Identifier}, ChannelHandle={channel.Handle}");
                 activeChannels.RemoveAt(i--);
                 removeChannelFromBassMix(channel);
             }
-
             FrameStatistics.Add(StatisticsCounterType.MixChannels, activeChannels.Count);
             base.UpdateState();
         }
@@ -293,31 +352,74 @@ namespace osu.Framework.Audio.Mixing.Bass
             if (Handle != 0)
                 return;
 
-            // Make sure that bass is initialised before trying to create a mixer.
-            // If not, this will be called again when the device is initialised via UpdateDevice().
-            if (!ManagedBass.Bass.GetDeviceInfo(ManagedBass.Bass.CurrentDevice, out var deviceInfo) || !deviceInfo.IsInitialized)
-                return;
+            bool hasGlobalMixer = manager?.GlobalMixerHandle.Value != null;
 
-            Handle = manager?.GlobalMixerHandle.Value != null
-                ? BassMix.CreateMixerStream(frequency, 2, BassFlags.MixerNonStop | BassFlags.Decode)
-                : BassMix.CreateMixerStream(frequency, 2, BassFlags.MixerNonStop);
+            // Make sure that bass is initialised before trying to create a mixer.
+            // Exception: In WASAPI Exclusive/ASIO mode, allow decode-only mixers even without standard device
+            if (!hasGlobalMixer)
+            {
+                if (!ManagedBass.Bass.GetDeviceInfo(ManagedBass.Bass.CurrentDevice, out var deviceInfo) || !deviceInfo.IsInitialized)
+                    return;
+            }
+            else
+            {
+                // For WASAPI Exclusive/ASIO, ensure we have a NoSound device for decode operations
+                if (ManagedBass.Bass.CurrentDevice == -1 || !ManagedBass.Bass.GetDeviceInfo(ManagedBass.Bass.CurrentDevice, out var currentDeviceInfo) || !currentDeviceInfo.IsInitialized)
+                {
+                    Logger.Log($"[AudioDebug] createMixer: Initializing NoSound device for decode-only mixer. CurrentDevice={ManagedBass.Bass.CurrentDevice}", LoggingTarget.Runtime, LogLevel.Debug);
+                    if (!ManagedBass.Bass.Init(ManagedBass.Bass.NoSoundDevice))
+                    {
+                        Logger.Log($"[AudioDebug] createMixer: Bass.Init(NoSound) failed: {ManagedBass.Bass.LastError}", LoggingTarget.Runtime, LogLevel.Error);
+                        return;
+                    }
+                }
+            }
+
+            int freq = frequency;
+            int chans = 2;
+
+            // 修复：如果全局 mixer handle 无效（0），直接报错并停止创建，避免死循环
+            if (hasGlobalMixer && manager!.GlobalMixerHandle.Value == 0)
+            {
+                Logger.Log($"[AudioDebug] createMixer: GlobalMixerHandle is 0, aborting mixer creation to avoid loop.", LoggingTarget.Runtime, LogLevel.Error);
+                return;
+            }
+
+            Handle = hasGlobalMixer
+                ? BassMix.CreateMixerStream(freq, chans, BassFlags.MixerNonStop | BassFlags.Decode)
+                : BassMix.CreateMixerStream(freq, chans, BassFlags.MixerNonStop);
+
+            Logger.Log($"[AudioDebug] createMixer: Mixer={Identifier}, Handle={Handle}, Freq={freq}, Chans={chans}, HasGlobal={hasGlobalMixer}, LastError={ManagedBass.Bass.LastError}", LoggingTarget.Runtime, LogLevel.Debug);
 
             if (Handle == 0)
                 return;
 
-            // Lower latency is valued more for the time since we are not using complex DSP effects. Disable buffering on the mixer channel in order for data to be produced immediately.
             ManagedBass.Bass.ChannelSetAttribute(Handle, ChannelAttribute.Buffer, 0);
 
-            // Register all channels that were previously played prior to the mixer being loaded.
             var toAdd = activeChannels.ToArray();
             activeChannels.Clear();
             foreach (var channel in toAdd)
                 AddChannelToBassMix(channel);
 
-            if (manager?.GlobalMixerHandle.Value != null)
-                BassMix.MixerAddChannel(manager.GlobalMixerHandle.Value.Value, Handle, BassFlags.MixerChanBuffer | BassFlags.MixerChanNoRampin);
+            if (hasGlobalMixer)
+            {
+                bool result = BassMix.MixerAddChannel(manager!.GlobalMixerHandle.Value!.Value, Handle, BassFlags.MixerChanBuffer | BassFlags.MixerChanNoRampin);
+                int lastError = (int)ManagedBass.Bass.LastError;
+                Logger.Log($"[AudioDebug] MixerAddChannel (createMixer) result={result}, LastError={lastError}", LoggingTarget.Runtime, LogLevel.Debug);
+            }
+            else
+            {
+                ManagedBass.Bass.ChannelPlay(Handle);
+            }
+        }
 
-            ManagedBass.Bass.ChannelPlay(Handle);
+        /// <summary>
+        /// 外部强制确保创建。
+        /// </summary>
+        internal void EnsureCreated()
+        {
+            if (Handle == 0)
+                EnqueueAction(createMixer);
         }
 
         /// <summary>
@@ -325,16 +427,15 @@ namespace osu.Framework.Audio.Mixing.Bass
         /// </summary>
         public void AddChannelToBassMix(IBassAudioChannel channel)
         {
-            // TODO: This fails and throws unobserved exceptions in github CI runs on macOS.
-            // Needs further investigation at some point as something is definitely not right.
-            // Debug.Assert(Handle != 0);
-            // Debug.Assert(channel.Handle != 0);
-
+            osu.Framework.Logging.Logger.Log($"[AudioDebug] AddChannelToBassMix: Mixer={Identifier}, ChannelHandle={channel.Handle}");
             BassFlags flags = BassFlags.MixerChanBuffer | BassFlags.MixerChanNoRampin;
             if (channel.MixerChannelPaused)
                 flags |= BassFlags.MixerChanPause;
 
-            if (BassMix.MixerAddChannel(Handle, channel.Handle, flags))
+            bool result = BassMix.MixerAddChannel(Handle, channel.Handle, flags);
+            int lastError = (int)ManagedBass.Bass.LastError;
+            osu.Framework.Logging.Logger.Log($"[AudioDebug] MixerAddChannel result={result}, LastError={lastError}");
+            if (result)
                 activeChannels.Add(channel);
         }
 
@@ -377,6 +478,21 @@ namespace osu.Framework.Audio.Mixing.Bass
                 ManagedBass.Bass.StreamFree(Handle);
                 Handle = 0;
             }
+        }
+
+        private void logChannelInfoForDebug(int handle, string tag)
+        {
+            if (handle == 0)
+            {
+                Logger.Log($"[AudioDebug] HandleInfo ({tag}): handle=0", LoggingTarget.Runtime, LogLevel.Debug);
+                return;
+            }
+            if (!ManagedBass.Bass.ChannelGetInfo(handle, out var info))
+            {
+                Logger.Log($"[AudioDebug] HandleInfo ({tag}): handle={handle} (0x{unchecked((uint)handle):X8}) ChannelGetInfo failed LastError={ManagedBass.Bass.LastError}", LoggingTarget.Runtime, LogLevel.Debug);
+                return;
+            }
+            Logger.Log($"[AudioDebug] HandleInfo ({tag}): handle={handle} (0x{unchecked((uint)handle):X8}) type={info.ChannelType} flags=0x{((uint)info.Flags):X8} freq={info.Frequency} chans={info.Channels}", LoggingTarget.Runtime, LogLevel.Debug);
         }
     }
 }
